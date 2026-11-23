@@ -1,0 +1,113 @@
+name: Build and publish release
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: build-release
+  cancel-in-progress: false
+jobs:
+  release:
+    name: Build, package, publish
+    runs-on: ubuntu-26.04
+    timeout-minutes: 350
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo apt-get clean
+          df -h /
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          submodules: recursive
+          fetch-depth: 0
+      - name: Restore Bazel disk cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ~/.cache/bazel-disk-cache
+          key: ${{ runner.os }}-bazel-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-bazel-
+      - name: Restore Bazel repository cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ~/.cache/bazel-repository-cache
+          key: ${{ runner.os }}-repository-cache-${{ hashFiles('MODULE.bazel.lock')
+            }}
+          restore-keys: |
+            ${{ runner.os }}-repository-cache-
+      - name: Install build dependencies
+        run: sudo ./etc/DependencyInstaller.sh -all
+      - name: Set install prefix
+        run: echo "INSTALL_PREFIX=${RUNNER_TEMP}/openroad" >> "${GITHUB_ENV}"
+      - name: Limit the Bazel disk cache
+        run: echo 'build --experimental_disk_cache_gc_max_size=5G' >> user.bazelrc
+      - name: Build and install OpenROAD
+        run: ./etc/Build.sh -prefix="${INSTALL_PREFIX}" -threads="$(nproc)"
+      - name: Build Python wheel
+        run: bazelisk build //python/openroad:openroad_wheel
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          "${INSTALL_PREFIX}/bin/openroad" -version
+          python3 -m venv /tmp/wheel-venv
+          /tmp/wheel-venv/bin/pip install --quiet bazel-bin/python/openroad/*.whl
+          QT_QPA_PLATFORM=offscreen /tmp/wheel-venv/bin/python - <<'PY'
+          from openroad import Tech
+          Tech()
+          print("Python wheel import OK")
+          PY
+      - name: Package artifacts
+        id: package
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          version=$(git describe --tags --match '[0-9][0-9]Q[0-9]' --always)
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "date=$(date -u +%Y-%m-%d)" >> "${GITHUB_OUTPUT}"
+          tar -C "$(dirname "${INSTALL_PREFIX}")" \
+            -czf dist/openroad-master-linux-x86_64.tar.gz \
+            "$(basename "${INSTALL_PREFIX}")"
+          cp bazel-bin/python/openroad/*.whl dist/
+          (cd dist && sha256sum openroad-master-linux-x86_64.tar.gz openroad-*.whl > SHA256SUMS)
+          ls -lh dist
+      - name: Save Bazel disk cache
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ~/.cache/bazel-disk-cache
+          key: ${{ runner.os }}-bazel-${{ github.sha }}
+      - name: Save Bazel repository cache
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ~/.cache/bazel-repository-cache
+          key: ${{ runner.os }}-repository-cache-${{ hashFiles('MODULE.bazel.lock')
+            }}
+      - name: Publish rolling release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |-
+          set -euo pipefail
+          gh release delete latest --yes --cleanup-tag || true
+          git push origin :refs/tags/latest || true
+          cat > release-notes.md <<EOF
+          Automated build of \`master\` at [\`${GITHUB_SHA:0:12}\`](https://github.com/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA}).
+          - OpenROAD version: \`${{ steps.package.outputs.version }}\`
+          - Built: ${{ steps.package.outputs.date }}
+          - Runner: Ubuntu 26.04, x86_64
+          Assets:
+          - \`openroad-master-linux-x86_64.tar.gz\` — install tree from \`etc/Build.sh -prefix\`; unpack and run \`openroad/bin/openroad\`.
+          - \`openroad-*.whl\` — Python API wheel; \`pip install openroad-*.whl\`.
+          - \`SHA256SUMS\` — checksums for the files above.
+          EOF
+          gh release create latest dist/* \
+            --target "${GITHUB_SHA}" \
+            --title "master ${GITHUB_SHA:0:7} (${{ steps.package.outputs.date }})" \
+            --notes-file release-notes.md \
+            --prerelease
