@@ -89,25 +89,29 @@ jobs:
           path: ~/.cache/bazel-repository-cache
           key: ${{ runner.os }}-repository-cache-${{ hashFiles('MODULE.bazel.lock')
             }}
-      - name: Publish rolling release
+      - name: Publish date release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |-
           set -euo pipefail
-          gh release delete latest --yes --cleanup-tag || true
-          git push origin :refs/tags/latest || true
+          tag="${{ steps.package.outputs.date }}"
+          title="master ${GITHUB_SHA:0:7} (${tag})"
           cat > release-notes.md <<EOF
           Automated build of \`master\` at [\`${GITHUB_SHA:0:12}\`](https://github.com/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA}).
           - OpenROAD version: \`${{ steps.package.outputs.version }}\`
-          - Built: ${{ steps.package.outputs.date }}
+          - Built: ${tag}
           - Runner: Ubuntu 26.04, x86_64
           Assets:
           - \`openroad-master-linux-x86_64.tar.gz\` — install tree from \`etc/Build.sh -prefix\`; unpack and run \`openroad/bin/openroad\`.
           - \`openroad-*.whl\` — Python API wheel; \`pip install openroad-*.whl\`.
           - \`SHA256SUMS\` — checksums for the files above.
           EOF
-          gh release create latest dist/* \
+          gh release delete "${tag}" --yes --cleanup-tag || true
+          git push origin ":refs/tags/${tag}" || true
+          gh release create "${tag}" dist/* \
             --target "${GITHUB_SHA}" \
-            --title "master ${GITHUB_SHA:0:7} (${{ steps.package.outputs.date }})" \
+            --title "${title}" \
             --notes-file release-notes.md \
-            --prerelease
+            --latest
+          gh release delete latest --yes --cleanup-tag || true
+          git push origin :refs/tags/latest || true
